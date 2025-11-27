@@ -9,3 +9,6 @@ chromadb
 nest-asyncio
 python-dotenv
 streamlit
+streamlit-mic-recorder
+requests
+sarvamai

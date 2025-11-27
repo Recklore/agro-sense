@@ -1,6 +1,6 @@
 .env
 chroma_db
-crop_env
+venv
 models
 models_cache
 

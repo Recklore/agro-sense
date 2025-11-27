@@ -30,7 +30,7 @@ def get_query_engine():
         return
 
     print("--- Setting up Models ---")
-    llm = Sarvam(model="sarvam-m", api_key=SARVAM_API_KEY, temperature=0.1)
+    llm = Sarvam(model="sarvam-m", api_key=SARVAM_API_KEY, temperature=0.2)
     
 
     embed_model = HuggingFaceEmbedding(
@@ -86,7 +86,18 @@ def get_query_engine():
         )
         print("Index built successfully!")
 
-    return index.as_query_engine(streaming=True)
+    # ... existing code ...
+
+    return index.as_query_engine(
+        streaming=True,
+        system_prompt="""
+You are the AgroSense Assistant, an expert in agriculture.
+Answer user questions based ONLY on the provided agricultural knowledge base.
+If the information to answer a question is not available in the agricultural knowledge base, state that you do not have enough information to answer that specific question. Do NOT make up answers.
+Avoid mentioning 'context information', 'retrieved documents', or any technical terms related to your internal processing.
+Be helpful and provide general agricultural advice if appropriate, but always prioritize information from the knowledge base when available.
+"""
+    )
 
 def main():
     query_engine = get_query_engine()

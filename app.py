@@ -1,53 +1,64 @@
-"""Streamlit interface for AgroSense crop recommendations and RAG chatbot."""
-
 from __future__ import annotations
-
 import os
-from typing import Generator, List, Tuple
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
 from dotenv import load_dotenv
+from typing import Generator, List, Tuple
+from streamlit_mic_recorder import mic_recorder
 
+# --- Environment and Page Configuration ---
 load_dotenv()
 
-
 def _sync_secrets_to_env() -> None:
-    """Propagate Streamlit secrets (if any) into os.environ before imports."""
-    secret_keys = ("SARVAM_API_KEY", "LLAMA_CLOUD_API_KEY")
-    for key in secret_keys:
-        try:
-            secret_val = st.secrets.get(key)
-        except Exception:  # pragma: no cover - st.secrets unavailable outside Streamlit
-            secret_val = None
-        if secret_val and not os.getenv(key):
-            os.environ[key] = secret_val
-
-
-def _configure_page() -> None:
-    st.set_page_config(
-        page_title="AgroSense Assistant",
-        page_icon="🌾",
-        layout="wide",
-    )
-    st.title("🌾 AgroSense Assistant")
-    st.caption(
-        "Get crop recommendations powered by a Random Forest model and chat with your knowledge base via RAG."
-    )
+    """Propagate Streamlit secrets to os.environ if not already set."""
+    try:
+        for key in ("SARVAM_API_KEY", "LLAMA_CLOUD_API_KEY"):
+            if key in st.secrets and not os.getenv(key):
+                os.environ[key] = st.secrets[key]
+    except Exception: # Covers StreamlitSecretNotFoundError and others
+        pass # Silently ignore if secrets are not configured, relying on .env
 
 
 _sync_secrets_to_env()
 
-from crop_predict import predict_top_3_crops  # noqa: E402
-from rag import get_query_engine  # noqa: E402
+st.set_page_config(
+    page_title="AgroSense Assistant",
+    page_icon="🌾",
+    layout="wide",
+)
 
+# --- Module Imports (after env setup) ---
+from crop_predict import predict_top_3_crops
+from rag import get_query_engine
+from sarvam_utils import transcribe_audio, synthesize_speech
 
+# --- Session State Initialization ---
+def initialize_session_state():
+    """Initialize all required session state variables."""
+    defaults = {
+        "chat_history": [{"role": "assistant", "content": "Hi! I am your AgroSense assistant. Ask me anything." }],
+        "recommendation_history": [],
+        "user_prompt": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+initialize_session_state()
+
+# --- Backend Loading ---
 @st.cache_resource(show_spinner="Booting Retrieval-Augmented Chatbot…")
 def load_query_engine():
     """Instantiate and cache the RAG query engine."""
-    return get_query_engine()
+    try:
+        return get_query_engine()
+    except Exception as e:
+        st.error(f"Failed to initialize the RAG query engine: {e}")
+        return None
 
+query_engine = load_query_engine()
 
+# --- Helper Functions ---
 def stream_response_chunks(response) -> Generator[str, None, None]:
     """Yield streaming tokens from a LlamaIndex Response."""
     if hasattr(response, "response_gen") and response.response_gen is not None:
@@ -56,114 +67,102 @@ def stream_response_chunks(response) -> Generator[str, None, None]:
     else:
         yield str(response)
 
-
-def render_crop_tab():
-    st.subheader("Crop Recommendation")
-    st.markdown(
-        "Provide soil nutrients and weather conditions to receive the three most suitable crops."
+def add_recommendation_to_chat(inputs: dict, recommendations: list):
+    """Formats and adds a crop recommendation summary to the chat history."""
+    summary = (
+        f"Based on your inputs (N={inputs['N']}, P={inputs['P']}, K={inputs['K']}, "
+        f"pH={inputs['ph']}, Temp={inputs['temperature']}°C, Humidity={inputs['humidity']}%, "
+        f"Rainfall={inputs['rainfall']}mm), the top 3 recommended crops are: "
+        f"{recommendations[0][0]}, {recommendations[1][0]}, and {recommendations[2][0]}."
     )
+    st.session_state.chat_history.append({
+        "role": "assistant",
+        "content": f"I have just received a crop recommendation. Here is a summary:\n{summary}"
+    })
 
+# --- UI Rendering: Tabs ---
+st.title("🌾 AgroSense Assistant")
+st.caption("Get crop recommendations and chat with your knowledge base via RAG.")
+
+tab_reco, tab_chat = st.tabs(["Crop Recommendation", "Agri Chatbot"])
+
+with tab_reco:
+    st.subheader("Get Crop Recommendations")
     with st.form("crop_form"):
         col1, col2 = st.columns(2)
         with col1:
-            N = st.number_input("Nitrogen (N)", min_value=0.0, max_value=200.0, value=50.0, step=1.0)
-            P = st.number_input("Phosphorous (P)", min_value=0.0, max_value=200.0, value=50.0, step=1.0)
-            K = st.number_input("Potassium (K)", min_value=0.0, max_value=200.0, value=50.0, step=1.0)
-            ph = st.number_input("pH", min_value=0.0, max_value=14.0, value=6.5, step=0.1)
+            N = st.number_input("Nitrogen (N)", 0.0, 200.0, 50.0, 1.0)
+            P = st.number_input("Phosphorous (P)", 0.0, 200.0, 50.0, 1.0)
+            K = st.number_input("Potassium (K)", 0.0, 200.0, 50.0, 1.0)
+            ph = st.number_input("pH", 0.0, 14.0, 6.5, 0.1)
         with col2:
             temperature = st.number_input("Temperature (°C)", value=25.0, step=0.1)
-            humidity = st.number_input("Humidity (%)", min_value=0.0, max_value=100.0, value=60.0, step=0.5)
-            rainfall = st.number_input("Rainfall (mm)", min_value=0.0, max_value=500.0, value=100.0, step=1.0)
-        submitted = st.form_submit_button("Recommend")
+            humidity = st.number_input("Humidity (%)", 0.0, 100.0, 60.0, 0.5)
+            rainfall = st.number_input("Rainfall (mm)", 0.0, 500.0, 100.0, 1.0)
+        
+        if st.form_submit_button("Recommend"):
+            with st.spinner("Predicting..."):
+                inputs = {"N": N, "P": P, "K": K, "ph": ph, "temperature": temperature, "humidity": humidity, "rainfall": rainfall}
+                recommendations = predict_top_3_crops(**inputs)
+                
+                if recommendations and not recommendations[0][0].lower().startswith("error"):
+                    st.session_state.recommendation_history.append({"inputs": inputs, "recommendations": recommendations})
+                    add_recommendation_to_chat(inputs, recommendations)
+                    
+                    df = pd.DataFrame(recommendations, columns=["Crop", "Confidence"])
+                    df["Confidence (%)"] = (df["Confidence"]*100).map(lambda v: f"{v:.2f}%")
+                    st.success(f"Best match: **{df.iloc[0,0]}** with {df.iloc[0,2]}")
+                    st.dataframe(df[["Crop", "Confidence (%)"]], hide_index=True, use_container_width=True)
+                else:
+                    st.error("Could not retrieve recommendations. Please check the model.")
 
-    if submitted:
-        with st.spinner("Predicting top crops…"):
-            recommendations: List[Tuple[str, float]] = predict_top_3_crops(
-                N=N,
-                P=P,
-                K=K,
-                temperature=temperature,
-                humidity=humidity,
-                ph=ph,
-                rainfall=rainfall,
-            )
-
-        if not recommendations:
-            st.warning("No recommendations returned. Please verify the model file.")
-            return
-
-        first_label = recommendations[0][0]
-        if first_label.lower().startswith("error"):
-            st.error(first_label)
-            return
-
-        df = pd.DataFrame(recommendations, columns=["Crop", "Confidence"])
-        df["Confidence (%)"] = (df["Confidence"] * 100).map(lambda v: f"{v:.2f}%")
-
-        st.success(f"Best match: **{df.iloc[0, 0]}** with {df.iloc[0, 2]}")
-        st.dataframe(df[["Crop", "Confidence (%)"]], hide_index=True, use_container_width=True)
-        chart_df = df.set_index("Crop")["Confidence"]
-        st.bar_chart(chart_df, height=250, use_container_width=True)
-
-
-def render_chat_tab(query_engine):
+with tab_chat:
     st.subheader("Knowledge-Base Chatbot")
-    st.markdown(
-        "Ask agronomy questions, pest remedies, or crop practices. Responses are augmented with your PDF knowledge base."
-    )
 
-    if query_engine is None:
-        st.warning(
-            "RAG system is not available. Ensure SARVAM and LLAMA Cloud API keys are configured and PDFs are ingested."
-        )
-        return
-
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = [
-            {
-                "role": "assistant",
-                "content": "Hi! I am your AgroSense assistant. Ask me anything about crops or farming techniques.",
-            }
-        ]
-
+    # Display Chat History
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
+            if msg["role"] == "assistant" and msg["content"]:
+                if st.button("🔊", key=f"play_{hash(msg['content'])}", help="Read this message aloud"):
+                    audio_bytes = synthesize_speech(msg["content"])
+                    if audio_bytes:
+                        st.audio(audio_bytes, format="audio/wav")
+    
+    # Chat Input and Audio Recorder Logic
+    prompt = None
+    
+    # Use columns to place recorder next to the input box area
+    col_input, col_mic = st.columns([4, 1])
+    with col_input:
+        text_input = st.chat_input("Ask a question or describe your soil...")
+        if text_input:
+            prompt = text_input
+    with col_mic:
+        st.write("") # Spacer for alignment
+        st.write("") # Spacer for alignment
+        audio_info = mic_recorder(start_prompt="🎤", stop_prompt="⏹️", key="recorder", format="wav")
 
-    user_prompt = st.chat_input("Ask a question about crops, soil, or pests…")
+    if audio_info and isinstance(audio_info, dict) and audio_info.get('bytes'):
+        with st.spinner("Transcribing audio..."):
+            prompt = transcribe_audio(audio_info['bytes'])
+            if not prompt:
+                st.warning("Could not understand the audio, please try again.")
 
-    if user_prompt:
-        st.session_state.chat_history.append({"role": "user", "content": user_prompt})
+    # Process the prompt if one exists
+    if prompt:
+        st.session_state.user_prompt = prompt
+        st.session_state.chat_history.append({"role": "user", "content": st.session_state.user_prompt})
+        
         with st.chat_message("user"):
-            st.markdown(user_prompt)
-
+            st.markdown(st.session_state.user_prompt)
+            
         with st.chat_message("assistant"):
-            try:
-                response = query_engine.query(user_prompt)
-                assistant_reply = st.write_stream(stream_response_chunks(response))
-            except Exception as exc:
-                assistant_reply = f"Sorry, an error occurred while querying the knowledge base: {exc}"
-                st.error(assistant_reply)
-
-        st.session_state.chat_history.append({"role": "assistant", "content": assistant_reply})
-
-
-def main():
-    _configure_page()
-
-    try:
-        query_engine = load_query_engine()
-    except Exception as exc:
-        query_engine = None
-        st.error(f"Failed to initialize the RAG query engine: {exc}")
-
-    tab_reco, tab_chat = st.tabs(["Crop Recommendation", "Agri Chatbot"])
-
-    with tab_reco:
-        render_crop_tab()
-    with tab_chat:
-        render_chat_tab(query_engine)
-
-
-if __name__ == "__main__":
-    main()
+            with st.spinner("Thinking..."):
+                if query_engine:
+                    response = query_engine.query(st.session_state.user_prompt)
+                    assistant_reply = st.write_stream(stream_response_chunks(response))
+                    st.session_state.chat_history.append({"role": "assistant", "content": assistant_reply})
+                    st.session_state.user_prompt = None # Clear prompt after processing
+                else:
+                    st.error("Query engine is not available.")
