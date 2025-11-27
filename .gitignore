@@ -1,0 +1,7 @@
+.env
+chroma_db
+crop_env
+models
+models_cache
+
+__pycache__

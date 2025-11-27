@@ -1,0 +1,11 @@
+pandas
+scikit-learn
+llama-index-core
+llama-parse
+llama-index-vector-stores-chroma
+llama-index-embeddings-huggingface
+llama-index-llms-sarvam
+chromadb
+nest-asyncio
+python-dotenv
+streamlit
